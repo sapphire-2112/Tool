@@ -163,19 +163,51 @@ def parse_args():
     p.add_argument("host", nargs="?", help="host (client mode) or port (listen mode if -l)")
     p.add_argument("port", nargs="?", type=int, help="port (client mode)")
     return p.parse_args()
+#Port Scanner:-
 
-
-#FROM HERE I AM GOING TO BUILD A PORT SCANNER..I HOPE IT SUCCEEDS
-def is_port_open(host,port,timeout):
+def is_port_open(host:str,port:int,timeout:float=0.5)-> str:
     s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         s.connect((host,port))
-        return True
-    except:
-        return False
+        return "open :)"
+    except ConnectionRefusedError:
+        return "closed :("
+    except socket.timeout:
+        return "filtered"
+    except OSError:
+        return "filtered"
     finally:
-        s.close()
+        try:
+            s.close()
+        except Exception:
+            pass
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+def scan_port_range(host:str,start:int,end:int,timeout:float=0.5,threads:int=100):
+    results={"open":[],"closed":[],"filtered":[]}
+    port=range(start,end+1)
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        future_to_port={ex.submit(is_port_open,host,p,timeout):p for p in port}
+        for future in as_completed(future_to_port):
+            port=future_to_port[future]
+            try:
+                status=future.result()
+            except Exception as e:
+                status="filtered"
+
+            results[status].append(port)
+        
+    for k in results:
+        results[k].sort()
+    return results
+
+COMMON_PORTS=[21,22,23,25,53,80,110,139,143,443,445,3306,3389,5900,8080]
+
+def scan_common_ports(host,timeout=0.5,threads=50):
+    return scan_port_list(host,COMMON_PORTS,timeout,threads)
+
+
 
 ## I will include everything in Main function at last.
 # ─────────────────────────────
