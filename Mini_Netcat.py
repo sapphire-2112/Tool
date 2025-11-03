@@ -4,11 +4,12 @@ import socket
 import threading
 import sys
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BUFFER_SIZE = 4096
 
 # ─────────────────────────────
-# Banner
+# Banner & Manual
 # ─────────────────────────────
 def print_banner():
     banner = r"""
@@ -20,6 +21,72 @@ def print_banner():
  (Creating something...)
 """
     print(banner)
+
+def print_man():
+    man = r"""
+NAME
+    mini_nc - minimal netcat-like tool + port scanner
+
+SYNOPSIS
+    mini_nc [OPTIONS] [host] [port]
+    mini_nc --scan HOST
+    mini_nc --scan-range HOST:START-END
+    mini_nc -l PORT [--keep] [--output-file FILE]
+
+DESCRIPTION
+    mini_nc is a small TCP client/server program with an integrated threaded port scanner.
+    It supports:
+      • interactive TCP client (stdin -> socket -> stdout)
+      • TCP server (listen and accept clients; optional file receive)
+      • file send / receive
+      • quick common-ports scan and numeric-range scan
+
+OPTIONS
+    -h, --help
+        Show short help and exit.
+
+    --man
+        Show this manual page and exit.
+
+    --verbose
+        Print debug/verbose messages.
+
+    -l, --listen
+        Listen mode (server). Provide port as positional after -l.
+
+    -k, --keep
+        Keep listening after client disconnect (server stays up).
+
+    --send-file, -sf FILE
+        (client) Send FILE and exit.
+
+    --output-file, -of FILE
+        (server) Append received bytes to FILE.
+
+    --scan, -s HOST
+        Quick scan of common ports on HOST.
+
+    --scan-range HOST:START-END
+        Scan HOST for ports in the numeric range START-END (inclusive).
+
+    --scan-timeout N
+        Timeout per port in seconds. Default 0.5.
+
+    --scan-threads N
+        Number of concurrent threads for scanning. Default 100.
+
+EXAMPLES
+    python3 mini_nc.py -l 5000
+    python3 mini_nc.py 127.0.0.1 5000
+    python3 mini_nc.py 127.0.0.1 5000 --send-file file.bin
+    python3 mini_nc.py --scan 192.168.1.10
+    python3 mini_nc.py --scan-range 192.168.1.10:1-1024
+
+SAFETY
+    Only scan hosts/networks you own or have explicit permission to test.
+    Unauthorized scanning may be illegal and may trigger intrusion detection.
+"""
+    print(man)
 
 
 # ─────────────────────────────
@@ -72,7 +139,10 @@ def client_mode(host, port, send_file=None):
         if send_file:
             with open(send_file, "rb") as f:
                 sent = 0
-                while chunk := f.read(BUFFER_SIZE):
+                while True:
+                    chunk = f.read(BUFFER_SIZE)
+                    if not chunk:
+                        break
                     sock.sendall(chunk)
                     sent += len(chunk)
                     print(f"\r[+] Sent {sent} bytes", end="", flush=True)
@@ -87,7 +157,10 @@ def client_mode(host, port, send_file=None):
         t_recv.join()
 
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except Exception:
+            pass
         print("[*] Disconnected from server.")
 
 
@@ -115,7 +188,10 @@ def handle_client_connection(client_sock, addr, output_file=None):
         client_sock.shutdown(socket.SHUT_RDWR)
     except Exception:
         pass
-    client_sock.close()
+    try:
+        client_sock.close()
+    except Exception:
+        pass
     print(f"[*] Connection closed with {addr[0]}:{addr[1]}")
 
 
@@ -145,7 +221,10 @@ def server_mode(port, keep=False, output_file=None):
     except KeyboardInterrupt:
         print("\n[!] Server shutting down...")
     finally:
-        server.close()
+        try:
+            server.close()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────
@@ -154,7 +233,7 @@ def server_mode(port, keep=False, output_file=None):
 def parse_args():
     p = argparse.ArgumentParser(
         prog="mini_nc",
-        description="mini netcat (safe) - send/receive data over TCP"
+        description="mini netcat (safe) - send/receive data over TCP and scan ports"
     )
     p.add_argument("-l", "--listen", action="store_true", help="listen mode (server)")
     p.add_argument("-k", "--keep", action="store_true", help="keep listening after client disconnect")
@@ -162,17 +241,30 @@ def parse_args():
     p.add_argument("--output-file", "-of", dest="output_file", help="(server) write received bytes to this file (append)")
     p.add_argument("host", nargs="?", help="host (client mode) or port (listen mode if -l)")
     p.add_argument("port", nargs="?", type=int, help="port (client mode)")
+    # scanner flags
+    p.add_argument("--scan", "-s", metavar="HOST", help="quick scan common ports on HOST")
+    p.add_argument("--scan-range", metavar="HOST:START-END", help="scan HOST for ports in START-END (example: 192.168.1.10:1-1024)")
+    p.add_argument("--scan-timeout", type=float, default=0.5, help="socket timeout (seconds) for scanning")
+    p.add_argument("--scan-threads", type=int, default=100, help="threads to use for concurrent port scanning")
+    p.add_argument("--man", action="store_true", help="show the manual page and exit")
+    p.add_argument("--verbose", action="store_true", help="print debug/verbose messages")
     return p.parse_args()
-#Port Scanner:-
 
-def is_port_open(host:str,port:int,timeout:float=0.5)-> str:
-    s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+
+# ─────────────────────────────
+# Port Scanner (unified)
+# ─────────────────────────────
+COMMON_PORTS = [21,22,23,25,53,80,110,139,143,443,445,3306,3389,5900,8080]
+
+def is_port_open(host: str, port: int, timeout: float = 0.5) -> str:
+    """Return 'open', 'closed', or 'filtered'."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        s.connect((host,port))
-        return "open :)"
+        s.connect((host, port))
+        return "open"
     except ConnectionRefusedError:
-        return "closed :("
+        return "closed"
     except socket.timeout:
         return "filtered"
     except OSError:
@@ -183,33 +275,48 @@ def is_port_open(host:str,port:int,timeout:float=0.5)-> str:
         except Exception:
             pass
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-def scan_port_range(host:str,start:int,end:int,timeout:float=0.5,threads:int=100):
-    results={"open":[],"closed":[],"filtered":[]}
-    port=range(start,end+1)
-    with ThreadPoolExecutor(max_workers=threads) as ex:
-        future_to_port={ex.submit(is_port_open,host,p,timeout):p for p in port}
-        for future in as_completed(future_to_port):
-            port=future_to_port[future]
-            try:
-                status=future.result()
-            except Exception as e:
-                status="filtered"
+def scan_ports(host: str, ports=None, start: int = None, end: int = None, timeout: float = 0.5, threads: int = 100):
+    """
+    Unified scanner:
+      - if ports is provided (iterable of ints) it scans those ports.
+      - otherwise start and end define an inclusive range.
+    Returns dict: {"open": [...], "closed": [...], "filtered": [...]}
+    """
+    if ports is not None:
+        port_iter = list(ports)
+    else:
+        if start is None or end is None:
+            raise ValueError("Either ports or (start and end) must be provided.")
+        port_iter = range(start, end + 1)
 
-            results[status].append(port)
-        
+    results = {"open": [], "closed": [], "filtered": []}
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        future_to_port = {ex.submit(is_port_open, host, p, timeout): p for p in port_iter}
+        for future in as_completed(future_to_port):
+            p = future_to_port[future]
+            try:
+                status = future.result()
+            except Exception:
+                status = "filtered"
+            results[status].append(p)
+
     for k in results:
         results[k].sort()
     return results
 
-COMMON_PORTS=[21,22,23,25,53,80,110,139,143,443,445,3306,3389,5900,8080]
+def scan_common_ports(host: str, timeout: float = 0.5, threads: int = 50):
+    return scan_ports(host, ports=COMMON_PORTS, timeout=timeout, threads=threads)
 
-def scan_common_ports(host,timeout=0.5,threads=50):
-    return scan_port_list(host,COMMON_PORTS,timeout,threads)
+def parse_range_arg(s: str):
+    """Parse 'host:1-1024' or '1-1024' -> (host_or_none, start, end)"""
+    if ":" in s:
+        host, rng = s.split(":", 1)
+    else:
+        host, rng = None, s
+    start_s, end_s = rng.split("-", 1)
+    return host, int(start_s), int(end_s)
 
 
-
-## I will include everything in Main function at last.
 # ─────────────────────────────
 # MAIN FUNCTION
 # ─────────────────────────────
@@ -217,6 +324,45 @@ def main():
     print_banner()
     args = parse_args()
 
+    if args.man:
+        print_man()
+        return
+
+    if args.verbose:
+        print("[DEBUG] parsed args:", args)
+
+    # Scanning options (run first if requested)
+    if args.scan:
+        host = args.scan
+        if args.verbose:
+            print("[DEBUG] running --scan on host:", host)
+        print(f"[+] Scanning common ports on {host} (timeout={args.scan_timeout}, threads={args.scan_threads}) ...")
+        res = scan_common_ports(host, timeout=args.scan_timeout, threads=args.scan_threads)
+        print("[+] Scan finished. Results:")
+        print("  Open:    ", res["open"])
+        print("  Closed:  ", res["closed"])
+        print("  Filtered:", res["filtered"])
+        return
+
+    if args.scan_range:
+        try:
+            host_part, start, end = parse_range_arg(args.scan_range)
+            if host_part is None:
+                print("error: scan-range requires host:START-END or provide host separately")
+                return
+            if args.verbose:
+                print(f"[DEBUG] running --scan-range on {host_part}:{start}-{end}")
+            print(f"[+] Scanning {host_part}:{start}-{end} (timeout={args.scan_timeout}, threads={args.scan_threads}) ...")
+            res = scan_ports(host_part, start=start, end=end, timeout=args.scan_timeout, threads=args.scan_threads)
+            print("[+] Scan finished. Results:")
+            print("  Open:    ", res["open"])
+            print("  Closed:  ", res["closed"])
+            print("  Filtered:", res["filtered"])
+        except Exception as e:
+            print(f"[!] scan-range parse/error: {e}")
+        return
+
+    # Normal netcat behavior
     if args.listen:
         if not args.host:
             print("error: port required in listen mode")
